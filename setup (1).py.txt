@@ -1,0 +1,26 @@
+from setuptools import setup, find_packages
+
+setup(
+    name="MultiCategoricalDistribution",
+    version='0.1.0',
+    packages=find_packages(),
+    install_requires=[
+        'torch',
+        'torchrl',
+        'tensordict',
+        'pandas',
+        'numpy',
+        'pyyaml',
+        'ipdb',
+        'gymnasium',
+        'wandb',
+        'tensorboard',
+        
+        
+        # ... add any other dependencies here
+    ],
+    # ... other setup options if needed
+)
+
+
+
