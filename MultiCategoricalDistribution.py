@@ -3,6 +3,7 @@ import torch
 from torch.distributions import Categorical, Distribution
 from typing import List
 import torch.nn as nn
+import torch.nn as nn
 
 
 class MultiCategorical(Distribution):
@@ -13,7 +14,7 @@ class MultiCategorical(Distribution):
              raise TypeError("All distributions in the list must be Categorical.")
         if not dists:
              raise ValueError("Distribution list cannot be empty.")
-        self.dists = nn.ModuleList(dists) # Use ModuleList to register submodules
+        self.dists = list(dists) # Use a standard list
 
     def log_prob(self, value):
         if value.shape[-1] != len(self.dists):
