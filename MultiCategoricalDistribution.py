@@ -2,6 +2,7 @@
 import torch
 from torch.distributions import Categorical, Distribution
 from typing import List
+import torch.nn as nn
 
 
 class MultiCategorical(Distribution):
