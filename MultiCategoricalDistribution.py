@@ -15,161 +15,159 @@ class MultiCategorical(Distribution):
         if not dists:
              raise ValueError("Distribution list cannot be empty.")
         self.dists = list(dists) # Use a standard list
+        # Determine the total number of categories by summing categories of individual distributions
+        self.total_categories = sum(d.param_shape[-1] for d in self.dists)
+        # Determine the event shape based on the structure of individual distributions
+        # Assuming each Categorical represents one sub-action feature for an agent
+        # The total event shape is the concatenation of event shapes of individual distributions
+        # If each Categorical has an event_shape of [], the combined event shape is [len(dists)]
+        # If the MultiCategorical represents actions for multiple agents and multiple sub-actions per agent,
+        # the event shape might be [num_agents, num_sub_actions_per_agent].
+        # Let's assume for now the MultiCategorical wraps distributions for a flattened action space
+        # of size num_agents * num_sub_distributions. The event shape would then be [len(dists)].
+        # If the distribution is intended to output a structured action [num_agents, num_sub_distributions],
+        # the event shape needs to reflect that.
+        # Based on the environment action_spec: shape=torch.Size([5, 4, 13]), this suggests the action for a single env
+        # is shaped [4, 13]. So the event shape of the *unbatched* distribution should be [4, 13].
+        # The number of individual distributions (len(dists)) should be num_agents * num_sub_distributions_per_agent = 4 * 13 = 52.
+        # Each distribution in self.dists corresponds to one of these 52 individual categorical choices.
+        # The event shape should represent the shape of a *single* sample from this distribution.
+        # If sampling returns [num_agents, num_sub_distributions], the event shape is [num_agents, num_sub_distributions].
+
+        # Let's infer the event shape from the individual distributions' event shapes and the expected total structure.
+        # Assuming self.dists is a flattened list of Categorical distributions covering all agents and sub-actions.
+        # The total number of individual categorical choices is len(self.dists).
+        # If the final action needs to be shaped [num_agents, num_sub_distributions_per_agent],
+        # and len(self.dists) = num_agents * num_sub_distributions_per_agent,
+        # the event shape should be [num_agents, num_sub_distributions_per_agent].
+        # Let's assume num_agents = 4 and num_sub_distributions_per_agent = 13 based on the environment spec.
+        self.num_agents = 4 # Hardcoded based on env setup
+        self.num_sub_distributions_per_agent = 13 # Hardcoded based on env setup
+        # Verify that the number of distributions matches the expected flattened size
+        if len(self.dists) != self.num_agents * self.num_sub_distributions_per_agent:
+             raise ValueError(f"Number of individual distributions ({len(self.dists)}) does not match expected number of categorical choices ({self.num_agents} * {self.num_sub_distributions_per_agent}).")
+
+        self._event_shape = torch.Size([self.num_agents, self.num_sub_distributions_per_agent]) # Set event shape to [4, 13]
+
 
     def log_prob(self, value):
-        if value.shape[-1] != len(self.dists):
-             # Adjust validation for the shape of the action value
-             # Expected value shape: (*batch_shape, num_agents, num_actions_per_feature)
-             # The total number of individual actions per graph/environment is num_agents * num_sub_distributions
-             # The value tensor from the environment step is likely shaped [batch_size, num_agents, num_sub_distributions]
-             # We need to match the number of individual distributions (num_agents * num_sub_distributions)
-             # with the last dimension of the value tensor after potentially reshaping or handling it.
-             # Let's assume the value tensor passed to log_prob is flattened to [batch_size, num_agents * num_sub_distributions]
-             # if the distribution samples a flattened action.
-             # Revisit this based on the actual output shape of the distribution's sample method.
-             # The sample method outputs [batch_size, num_agents * num_sub_distributions] if MultiCategorical is over flattened actions.
-             # So, value shape for log_prob should match this.
-             # The number of individual distributions is len(self.dists) = num_agents * num_sub_distributions.
-             # The last dimension of value should be num_agents * num_sub_distributions.
-             # The current check value.shape[-1] != len(self.dists) is correct if value is flattened to [batch_size, num_agents * num_sub_distributions]
+        # value shape: (*batch_shape, num_agents, num_sub_distributions_per_agent)
+        # We need to flatten the value tensor to match the flattened list of distributions for log_prob calculation.
+        # The flattened value shape should be (*batch_shape, num_agents * num_sub_distributions_per_agent)
 
-             raise ValueError(f"Value shape {value.shape} last dimension must match number of distributions {len(self.dists)}")
+        # Determine batch shape from the value tensor
+        batch_shape = value.shape[:-len(self.event_shape)]
 
-        ans = []
-        # Ensure splitting happens on the last dimension where individual actions are stacked
-        # Value shape is expected to be (batch_size, num_agents * num_sub_distributions)
-        # Split along the last dimension (num_agents * num_sub_distributions) to get actions for each individual distribution
-        # The split size should be 1 if each individual distribution corresponds to a single action component.
-        # If nvec was [3, 3, ..., 3] (13 times), and len(dists) = num_agents * num_sub_distributions = 5 * 13 = 65
-        # Value shape is [batch_size, 65]. Splitting with size 1 along dim -1 gives 65 tensors of shape [batch_size, 1].
-        values_split = torch.split(value, 1, dim=-1) # Split size 1 along the last dimension
-        if len(values_split) != len(self.dists):
-             raise ValueError(f"Splitting value tensor resulted in {len(values_split)} tensors, but expected {len(self.dists)}")
+        # Flatten the last two dimensions of the value tensor to match the flattened distributions
+        # Expected shape after flattening: (*batch_shape, len(self.dists))
+        value_flat = value.view(*batch_shape, -1) # Shape (*batch_shape, 52)
 
-        for d, v in zip(self.dists, values_split):
-            # Squeeze the last dimension of v, which is 1 after splitting
-            ans.append(d.log_prob(v.squeeze(-1))) # log_prob expects shape [batch_size]
+        if value_flat.shape[-1] != len(self.dists):
+             raise ValueError(f"Value tensor last dimension ({value_flat.shape[-1]}) does not match the number of individual distributions ({len(self.dists)}).")
 
-        # Stack the log_probs and sum across the individual distributions
-        return torch.stack(ans, dim=-1).sum(dim=-1) # Sum log_probs across the individual distributions dimension
+        # Calculate log_prob for each individual categorical choice
+        # dist.log_prob(value_flat[..., i]) will have shape (*batch_shape,)
+        # We need to stack these log_probs and then sum them along the last dimension.
+        log_probs_list = [dist.log_prob(value_flat[..., i]) for i, dist in enumerate(self.dists)] # List of tensors, each shape (*batch_shape,)
 
+        # Stack the log probabilities along a new dimension
+        log_probs_stacked = torch.stack(log_probs_list, dim=-1) # Shape (*batch_shape, len(self.dists))
 
-    def entropy(self):
-        # Stack the entropies and sum across the individual distributions
-        return torch.stack([d.entropy() for d in self.dists], dim=-1).sum(dim=-1) # Sum entropies across individual distributions dimension
+        # Sum the log probabilities across the individual distributions dimension
+        total_log_prob = log_probs_stacked.sum(dim=-1) # Shape (*batch_shape,)
 
+        return total_log_prob
 
     def sample(self, sample_shape=torch.Size()):
-        # Sample from each categorical distribution and stack the results
-        # Expected output shape: (*batch_shape, num_agents * num_sub_distributions)
-        samples = [d.sample(sample_shape) for d in self.dists]
-        return torch.stack(samples, dim=-1) # Stack along a new last dimension
+        # Sample from each individual categorical distribution
+        # dist.sample(sample_shape) will have shape (sample_shape, *batch_shape)
+        # We need to collect samples for each distribution, potentially reshape, and concatenate.
+
+        # Assuming each distribution in self.dists has a batch_shape that is consistent.
+        # The batch shape of the MultiCategorical distribution is the batch shape of its constituent distributions.
+        # Let's infer the batch shape from the first distribution.
+        if not self.dists:
+             raise ValueError("Cannot sample from an empty distribution list.")
+        dist_batch_shape = self.dists[0].batch_shape
+
+        # Samples from individual distributions, each will have shape (sample_shape, *dist_batch_shape)
+        samples_list = [dist.sample(sample_shape) for dist in self.dists]
+
+        # Concatenate the samples along a new dimension
+        # The shape after stacking will be (sample_shape, *dist_batch_shape, len(self.dists))
+        samples_stacked = torch.stack(samples_list, dim=-1) # Shape (sample_shape, *dist_batch_shape, 52)
 
 
-def multi_categorical_maker(nvec):
-    # nvec: List of number of categories for each individual action component.
-    # Expected length: num_agents * num_sub_distributions_per_agent.
-    # Expected elements: num_categories_per_sub_distribution.
-
-    # We need access to num_agents to infer batch size. Assuming it's available globally from env.num_agents.
-    # We also need num_sub_distributions_per_agent and num_categories_per_sub_distribution for reshaping.
-    # Assuming these are available globally from previous calculations in the main script.
-    # Accessing global variables directly within the maker function might not be robust.
-    # A better approach is to pass these dimensions when calling multi_categorical_maker in the main script,
-    # and have the inner function closure over them.
-
-    # Let's assume num_agents, num_sub_distributions, num_categories are available in the scope
-    # where multi_categorical_maker is called and are captured by the closure.
-    # This requires modifying how multi_categorical_maker is called in the main script.
-    # In the main script, we calculated num_agents, num_sub_distributions, num_categories
-    # and nvec_for_maker. We should pass these to multi_categorical_maker.
-
-    # Modified multi_categorical_maker signature and inner function:
-    # def multi_categorical_maker(num_agents, num_sub_distributions, num_categories):
-    #     nvec = [num_categories] * (num_agents * num_sub_distributions) # Generate nvec here
-
-    #     def get_multi_categorical(logits):
-    #         # ... reshaping logic using num_agents, num_sub_distributions, num_categories ...
-    #         # ... slicing using nvec ...
-    #         # ... return MultiCategorical(dists) ...
-    #     return get_multi_categorical
-
-    # For now, let's stick to the user's provided signature `def multi_categorical_maker(nvec):`
-    # and assume num_agents, num_sub_distributions, num_categories are available globally
-    # or derived from nvec.
-
-    # Assuming nvec is [num_categories] repeated num_agents * num_sub_distributions times.
-    num_individual_distributions = len(nvec) # num_agents * num_sub_distributions
-    num_categories = nvec[0] if nvec else 0 # Assuming uniform categories
-
-    # Need num_agents and num_sub_distributions.
-    # num_individual_distributions = num_agents * num_sub_distributions
-    # Cannot uniquely determine num_agents and num_sub_distributions from their product.
-    # This suggests multi_categorical_maker needs more information than just nvec,
-    # or the structure of nvec needs to implicitly encode num_agents and num_sub_distributions.
-
-    # Let's revert to the assumption that num_agents is available globally
-    # and derive num_sub_distributions from num_individual_distributions and num_agents.
-    # Assuming num_agents is available globally (like env.num_agents).
-    global env # Access global environment to get num_agents
-    if env is None:
-         print("Warning: Environment not available in multi_categorical_maker scope. Cannot determine num_agents.")
-         # Fallback or error handling if env is not available
-         # For now, let's assume env is available and num_agents can be accessed.
-         num_agents = env.num_agents if 'env' in globals() and env is not None else None
-    else:
-         num_agents = env.num_agents
-
-    if num_agents is None:
-         raise ValueError("num_agents is not available in multi_categorical_maker scope.")
-
-    if num_individual_distributions % num_agents != 0:
-         raise ValueError(f"Number of individual distributions ({num_individual_distributions}) is not divisible by num_agents ({num_agents}).")
-
-    num_sub_distributions = num_individual_distributions // num_agents
+        # Reshape the stacked samples to the desired event shape: [num_agents, num_sub_distributions_per_agent]
+        # The target shape is (sample_shape, *dist_batch_shape, num_agents, num_sub_distributions_per_agent)
+        target_shape = sample_shape + dist_batch_shape + self._event_shape # Concatenate tuples
+        samples_reshaped = samples_stacked.view(target_shape) # Shape (sample_shape, *dist_batch_shape, 4, 13)
 
 
-    def get_multi_categorical(logits):
-        # Input logits shape: [batch_size * num_agents, num_sub_distributions * num_categories]
-
-        input_shape = logits.shape
-        batch_size_nodes = input_shape[0] # batch_size * num_agents
-        params_per_agent = input_shape[1] # num_sub_distributions * num_categories
-
-        # Validate input dimensions against derived dimensions
-        if batch_size_nodes % num_agents != 0:
-             raise ValueError(f"Input batch size ({batch_size_nodes}) is not divisible by num_agents ({num_agents}).")
-
-        inferred_batch_size = batch_size_nodes // num_agents
-
-        num_individual_distributions_from_logits = params_per_agent // num_categories # Should be num_sub_distributions
-        if num_individual_distributions_from_logits != num_sub_distributions:
-             raise ValueError(f"Derived individual distributions from logits ({num_individual_distributions_from_logits}) does not match calculated num_sub_distributions ({num_sub_distributions}).")
+        return samples_reshaped
 
 
-        # Reshape logits from [batch_size * num_agents, num_sub_distributions * num_categories]
-        # to [batch_size, num_agents * num_sub_distributions, num_categories] for slicing.
-        # This is equivalent to reshaping to [inferred_batch_size, num_individual_distributions, num_categories].
+    def expand(self, batch_shape, _instance=None):
+        # Implement expand if needed for batching
+        raise NotImplementedError("Expand not implemented for MultiCategorical.")
 
-        reshaped_logits = logits.view(
-            inferred_batch_size,
-            num_individual_distributions, # num_agents * num_sub_distributions
-            num_categories # num_categories
-        )
+    @property
+    def batch_shape(self):
+        # The batch shape of the MultiCategorical is the batch shape of its constituent distributions.
+        if not self.dists:
+             return torch.Size([])
+        return self.dists[0].batch_shape
 
-        dists = []
-        # Slice along the second dimension (num_individual_distributions) to get parameters for each distribution
-        for i in range(num_individual_distributions):
-            # Slice the parameters for the i-th individual distribution
-            # The slice should take all batch elements and all categories for this distribution.
-            # Assuming uniform categories for simpler slicing.
-            dist_logits = reshaped_logits[:, i, :] # Shape [batch_size, num_categories]
-            dists.append(Categorical(logits=dist_logits))
+    @property
+    def event_shape(self):
+        return self._event_shape # Return the defined event shape [4, 13]
 
-        # Ensure the MultiCategorical class is accessible here (imported at the top)
-        return MultiCategorical(dists)
 
-    return get_multi_categorical
+    def __repr__(self):
+        return f"MultiCategorical(num_dists={len(self.dists)}, event_shape={self.event_shape}, batch_shape={self.batch_shape})"
 
-# Assuming MultiCategorical class is defined above or imported.
-# If it's defined in the same file, ensure its definition is before multi_categorical_maker.
+# Define the maker function for the MultiCategorical distribution
+# This function will be used by ProbabilisticTensorDictModule to create the distribution
+# from the 'logits' output of the network.
+# The 'logits' tensor should have shape (*batch_shape, num_agents, num_sub_distributions_per_agent, num_categories_per_sub_action)
+# The maker function receives keyword arguments corresponding to the out_keys of the wrapped module.
+# In this case, it receives 'logits'.
+def multi_categorical_maker(**kwargs):
+    # kwargs should contain 'logits' with shape (*batch_shape, num_agents, num_sub_distributions_per_agent, num_categories_per_sub_action)
+    logits = kwargs.get("logits")
+    if logits is None:
+         raise ValueError("MultiCategorical maker function expects 'logits' as input.")
+
+    # Determine batch shape from the logits tensor
+    # The dimensions corresponding to num_agents, num_sub_distributions_per_agent, and num_categories_per_sub_action are event/parameter dimensions.
+    # The batch shape is the leading dimensions.
+    num_categories_per_sub_action = logits.shape[-1] # Should be 3
+    num_sub_distributions_per_agent = logits.shape[-2] # Should be 13
+    num_agents = logits.shape[-3] # Should be 4
+    batch_shape = logits.shape[:-3]
+
+    # Flatten the logits to create individual Categorical distributions
+    # The flattened logits shape should be (*batch_shape, num_agents * num_sub_distributions_per_agent, num_categories_per_sub_action)
+    logits_flat = logits.view(*batch_shape, -1, num_categories_per_sub_action) # Shape (*batch_shape, 52, 3)
+
+    # Create a list of Categorical distributions
+    dists_list = [Categorical(logits=logits_flat[..., i, :]) for i in range(logits_flat.shape[-2])] # List of 52 Categorical distributions, each with batch_shape (*batch_shape,)
+
+    # Instantiate the MultiCategorical distribution
+    return MultiCategorical(dists_list)
+
+# This is the original maker function signature provided by the user, which is incomplete.
+# It seems the user intended to define the maker function that takes 'nvec'
+# and potentially returns a callable that takes 'logits'.
+# Let's redefine the maker function to match the expected signature for a distribution_class in ProbabilisticTensorDictModule,
+# which is usually a callable that takes the output of the wrapped module (logits in this case) as keyword arguments.
+# The initial definition above follows this pattern.
+
+# If the user specifically intended the maker to take 'nvec' first, we would need
+# to change how ProbabilisticTensorDictModule is used or define a different type of maker.
+# Given the context of using it with ProbabilisticTensorDictModule and the error
+# happening during policy call, the maker needs to be the function that takes logits.
+
+# Let's keep the correct multi_categorical_maker defined above and assume
+# that the user's provided snippet was an attempt to redefine it incorrectly.
+# No changes needed to the correct definition.
