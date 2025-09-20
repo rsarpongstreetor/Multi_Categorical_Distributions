@@ -43,6 +43,44 @@ class MultiCategorical(Distribution):
         samples = [d.sample(sample_shape) for d in self.dists]
         return torch.stack(samples, dim=-1)
 
+# Inside your MultiCategorical class definition in MultiCategoricalDistribution.py
+
+    @property
+    def deterministic_sample(self) -> torch.Tensor:
+        """
+        Returns the mode of the MultiCategorical distribution.
+        This corresponds to the action with the highest probability for each
+        of the individual categorical choices.
+        """
+        # Assuming self.logits has shape [..., num_agents, num_individual_actions_features * num_action_categories]
+        # And the logits are grouped by action feature, then category
+        # Reshape logits to [..., num_agents, num_individual_actions_features, num_action_categories]
+        logits_reshaped = self.logits.view(
+            *self.logits.shape[:-1],
+            self.action_spec.shape[-2], # num_individual_actions_features
+            self.action_spec.space.nvec[0].item() # num_action_categories (assuming all have the same n)
+        )
+    
+        # Get the index of the maximum logit for each individual action feature
+        # The action is the index with the highest probability
+        mode = torch.argmax(logits_reshaped, dim=-1) # Shape [..., num_agents, num_individual_actions_features]
+    
+        # The action spec is MultiCategorical with shape [num_agents, num_individual_actions_features]
+        # The sampled action should match this shape.
+        return mode.to(self.action_spec.dtype) # Ensure dtype matches action spec
+    
+    
+    # You might also need a .mode property for compatibility with some torchrl components
+    @property
+    def mode(self) -> torch.Tensor:
+        """
+        Returns the mode of the distribution. Alias for deterministic_sample.
+        """
+        return self.deterministic_sample
+
+
+
+
 
 def multi_categorical_maker(nvec):
     # nvec: List of number of categories for each individual action component
